@@ -175,3 +175,90 @@ pair_all() {
     done
     return 1
 }
+
+# --- audio follows a set of displays ----------------------------------
+#
+# MUTE_DISPLAY_IDS (in bt-devices.conf, empty = feature off) lists displays
+# by EDID triple or name — run `display-watcher --list` with one plugged in
+# to get the values. System output is muted while ANY listed display is
+# attached, and unmuted once NONE of them are. Listing several is how you
+# cover more than one desk without caring which one you are at.
+#
+# "Unmuted" means only undoing our own work: the marker file records a mute
+# this script performed on an unmuted system, so a mute the user set
+# themselves is never silently lifted on disconnect.
+MUTE_MARKER=/tmp/smart-bt-kvm.muted
+
+# "Is any of these displays attached?" — the whole list goes in one call so
+# the answer comes from a single display snapshot. Deliberately softer than
+# external_display_attached, which aborts the script on a failed query: the
+# audio rule is bolted onto the pairing logic and must never take it down.
+# 0 = at least one attached, 1 = none, 2 = unknown.
+any_display_attached() {
+    local out rc
+    out=$("$DISPLAY_STATUS_BIN" --has "$@" 2>/dev/null)
+    rc=$?
+    if [ "$rc" -gt 1 ]; then
+        log "audio: '$DISPLAY_STATUS_BIN --has $*' failed (exit $rc); leaving volume alone"
+        return 2
+    fi
+    log "audio: $out"
+    return "$rc"
+}
+
+# 0 = muted, 1 = unmuted, 2 = unreadable. Some output devices (notably
+# HDMI/DisplayPort audio on the monitor itself) report "missing value"
+# rather than a boolean, which is why 2 is a real case and not paranoia.
+output_muted() {
+    local v
+    v=$(osascript -e 'output muted of (get volume settings)' 2>/dev/null)
+    case "$v" in
+        true)  return 0 ;;
+        false) return 1 ;;
+        *)     log "audio: could not read mute state (got '${v:-<nothing>}')"; return 2 ;;
+    esac
+}
+
+set_output_muted() {            # $1 = true | false
+    if osascript -e "set volume output muted $1" >> "$LOG" 2>&1; then
+        return 0
+    fi
+    log "audio: 'set volume output muted $1' failed"
+    return 1
+}
+
+# Idempotent: re-runnable on every display event and at wake, which is how
+# the undock-while-asleep case gets unmuted.
+sync_audio_for_display() {
+    [ "${#MUTE_DISPLAY_IDS[@]}" -gt 0 ] || return 0
+
+    local attached muted
+    any_display_attached "${MUTE_DISPLAY_IDS[@]}"; attached=$?
+    [ "$attached" -eq 2 ] && return 0
+
+    output_muted; muted=$?
+
+    if [ "$attached" -eq 0 ]; then
+        if [ "$muted" -eq 0 ]; then
+            log "audio: a listed display is attached; output already muted"
+            return 0
+        fi
+        set_output_muted true || return 1
+        if [ "$muted" -eq 1 ]; then
+            : > "$MUTE_MARKER"
+            log "audio: a listed display is attached; muted output"
+        else
+            # We changed something we couldn't read first, so we can't
+            # promise to put it back — mute, but don't claim the unmute.
+            log "audio: a listed display is attached; muted output (prior state unknown, will not auto-unmute)"
+        fi
+    else
+        if [ ! -f "$MUTE_MARKER" ]; then
+            log "audio: no listed display attached; no mute of ours to undo"
+            return 0
+        fi
+        set_output_muted false || return 1
+        rm -f "$MUTE_MARKER"
+        log "audio: no listed display attached; unmuted output"
+    fi
+}

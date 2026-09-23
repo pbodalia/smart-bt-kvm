@@ -6,6 +6,10 @@ power-cycle the accessory (or plug it in via cable for ~2s) near the
 arriving Mac while its pair loop is retrying. Both Macs run the same
 scripts; the docked/undocked gates decide which role each Mac plays.
 
+It also carries a smaller, independent rule: **mute system output while any
+of a named set of displays is attached**, and unmute once none of them are.
+See [Muting on specific displays](#muting-on-specific-displays).
+
 ## Why unpair/pair, not disconnect/connect
 
 Tested on real hardware and worth remembering:
@@ -23,11 +27,11 @@ Tested on real hardware and worth remembering:
 
 | File | Trigger | Covers |
 |---|---|---|
-| `display-watcher.swift` + `display-event-handler.sh` + `com.smart-bt-kvm.plist` | External-display presence diff on `NSApplication.didChangeScreenParametersNotification` (AppKit run loop, launchd agent; `CGDisplayRegisterReconfigurationCallback` never fires for CLI processes — hardware-tested) | Awake either way: monitor unplugged → unpair; monitor plugged in → pair. Also catches the display that enumerates a few seconds after a hotplug-triggered wake |
+| `display-watcher.swift` + `display-event-handler.sh` + `com.smart-bt-kvm.plist` | External-display diff on `NSApplication.didChangeScreenParametersNotification` (AppKit run loop, launchd agent; `CGDisplayRegisterReconfigurationCallback` never fires for CLI processes — hardware-tested). Fires `added` / `removed` / `changed` | Awake either way: monitor unplugged → unpair; monitor plugged in → pair. Also catches the display that enumerates a few seconds after a hotplug-triggered wake, and drives the mute rule |
 | `on-sleep.sh` (installed as `~/.sleep`) | System will-sleep via sleepwatcher | Leaving, clamshell — display unplug sleeps the machine before events fire |
-| `on-wakeup.sh` (installed as `~/.wakeup`) | System wake via sleepwatcher, gated on external display attached | Arriving by waking an already-docked Mac (lid open, key press) |
+| `on-wakeup.sh` (installed as `~/.wakeup`) | System wake via sleepwatcher, gated on external display attached | Arriving by waking an already-docked Mac (lid open, key press). Also re-applies the mute rule, covering a dock/undock that happened while asleep |
 | `bt-actions.sh` | — | Shared library (config, gates, `unpair_all`, `pair_all` with retry + lock); sourced by the three scripts above |
-| `bt-devices.conf` | — | Device IDs, installed to `~/.config/bt-devices.conf` |
+| `bt-devices.conf` | — | Device IDs and `MUTE_DISPLAY_IDS`, installed to `~/.config/bt-devices.conf` |
 
 The sleep hook's "am I being undocked?" gate is the hard-won part. At
 will-sleep time, display state lies in every queryable form
@@ -43,15 +47,61 @@ the 10s timeout; that delay is invisible in practice.
 
 Other design notes:
 
-- The event handler gates on "is an external display attached now", not
-  on which display changed — closing the lid while docked or opening it
-  undocked correctly does nothing.
+- The event handler gates the *pairing* on "is an external display
+  attached now", not on which display changed — closing the lid while
+  docked or opening it undocked correctly does nothing. The mute rule is
+  the exact opposite (it cares about one specific display), which is why
+  the watcher diffs display identities rather than a presence flag and
+  reports `changed` when the set changes without presence flipping.
 - `pair_all` is two-branch: unpaired → `--pair` (needs the power-cycle),
   paired-but-disconnected → `--connect` (safe, no pairing risk).
   Concurrent triggers (wake hook + display-added event) are deduplicated
   by a pid-checked lock.
 - Every gate decision logs its inputs (`display gate: ...`,
   `power source: ...`) to make the next misfire diagnosable from the log.
+
+## Muting on specific displays
+
+List displays in `MUTE_DISPLAY_IDS` in `~/.config/bt-devices.conf` and
+system output is muted while **any** of them is attached, and unmuted once
+**none** of them are. Leave the list empty and nothing in this section runs.
+
+```sh
+MUTE_DISPLAY_IDS=(
+    "10ac:427c:3933384c"     # the monitor at the office
+    "LG HDR 4K"              # the one at home, matched by name
+)
+```
+
+Any-of, rather than one-per-rule, is what makes moving between desks behave:
+unplugging the office monitor while a second listed display is still attached
+keeps the Mac muted, and it only comes back when you are away from all of
+them. The whole list is checked in one query, so the answer always comes from
+a single consistent snapshot of what is plugged in.
+
+To find the IDs, plug a display in and run:
+
+```sh
+~/bin/display-watcher --list
+```
+
+```
+ID                        KIND      NAME
+1e6d:5b11:1010101         external  LG HDR 4K
+610:a050:0                builtin   Built-in Retina Display
+```
+
+Each ID is that display's EDID `vendor:model:serial` triple. **Do not use
+`CGDirectDisplayID`** — the number most display tooling shows you — because
+macOS reassigns it per session; the EDID triple survives replug and reboot.
+If a triple ends in `:0` (the panel reports no serial) and you own two
+identical monitors, put the `NAME` in the list instead; matching accepts
+either, case-insensitively, and you can mix the two forms.
+
+The unmute is deliberately conservative: it only ever reverses a mute these
+scripts performed on an unmuted system, recorded in `/tmp/smart-bt-kvm.muted`.
+Mute the Mac yourself before docking and unplugging the display will leave it
+muted, because that mute was not ours to undo.
 
 ## Install (on both Macs)
 
@@ -100,9 +150,25 @@ Everything logs to `/tmp/smart-bt-kvm.log`, prefixed `[display-event]` /
    unpairing — this is the case that took four attempts to detect.
 5. Full round trip between both Macs, watching `/tmp/smart-bt-kvm.log`
    on both sides.
+6. With `MUTE_DISPLAY_IDS` set: plug a listed display in and check the menu
+   bar volume shows muted (`audio: a listed display is attached; muted
+   output`); unplug it and check it comes back (`audio: no listed display
+   attached; unmuted output`). Plugging in an *unlisted* external should log
+   `audio: no match for: ...` and leave the volume alone. With two listed
+   displays attached, unplugging one should leave it muted.
 
 ## Known caveats
 
+- Muting uses AppleScript (`set volume output muted`), which acts on the
+  **current output device**. If docking also switches output to the
+  monitor's own HDMI/DisplayPort speakers, that device may report
+  `missing value` for its mute state and ignore the change. The log says
+  so (`audio: could not read mute state`, `audio: 'set volume ...' failed`);
+  the fallback is to pick a different output device in Sound settings.
+- Name matching (rather than the EDID triple) needs a WindowServer
+  connection and sees only *active* displays, so it is best-effort: it
+  will not resolve over ssh, and can miss a mirrored or sleeping panel.
+  The triple has neither limitation — prefer it.
 - `blueutil` needs Bluetooth privacy permission. Under launchd/sleepwatcher
   the prompt may not appear — if it works in Terminal but fails silently
   from the agents, check System Settings → Privacy & Security → Bluetooth

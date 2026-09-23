@@ -27,6 +27,12 @@ install -m 755 on-wakeup.sh "$HOME/.wakeup"
 if [ ! -f "$HOME/.config/bt-devices.conf" ]; then
     install -m 644 bt-devices.conf "$HOME/.config/bt-devices.conf"
     echo "NOTE: first install — edit ~/.config/bt-devices.conf and set DEVICE_IDS (see: blueutil --paired)"
+elif ! grep -q MUTE_DISPLAY_IDS "$HOME/.config/bt-devices.conf"; then
+    # Config files are never overwritten, so a knob added after an install
+    # would otherwise stay invisible to anyone already running this.
+    echo "NOTE: ~/.config/bt-devices.conf predates MUTE_DISPLAY_IDS (mute output while"
+    echo "      any listed display is attached). To use it, copy the block from"
+    echo "      bt-devices.conf; list your displays with: $HOME/bin/display-watcher --list"
 fi
 
 # Bake this machine's home dir into the plist (launchd doesn't expand ~).
